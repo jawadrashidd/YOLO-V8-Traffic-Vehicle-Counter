@@ -1,62 +1,72 @@
-## Preparing a custom dataset
+## Our Pipeline
 
-Building a custom dataset can be a painful process. It might take dozens or even hundreds of hours to collect images, label them, and export them in the proper format. Fortunately, Roboflow makes this process as straightforward and fast as possible. Let me show you how!
+The project runs in Google Colab on a GPU. It goes from a labelled dataset to a counted output video in seven steps.
 
-### Step 1: Creating project
+### Step 1: Set up the environment
 
-Before you start, you need to create a Roboflow [account](https://app.roboflow.com/login). Once you do that, you can create a new project in the Roboflow [dashboard](https://app.roboflow.com/). Keep in mind to choose the right project type. In our case, Object Detection.
+We check that a GPU is available with `nvidia-smi`, then install `ultralytics==8.0.20` to get YOLOv8.
 
-<div align="center">
-  <img
-    width="640"
-    src="https://media.roboflow.com/preparing-custom-dataset-example/creating-project.gif?ik-sdk-version=javascript-1.4.3&updatedAt=1672929799852"
-  >
-</div>
+### Step 2: Get the dataset
 
-### Step 2: Uploading images
+Our dataset is hosted on Roboflow (workspace `jawad`, project `object-detect-korbo`, version 1). We download it into `{HOME}/datasets` in YOLOv8 format. The download includes the images, their label files and a `data.yaml` that lists the two classes:
 
-Next, add the data to your newly created project. You can do it via API or through our [web interface](https://docs.roboflow.com/adding-data/object-detection).
+| Class ID | Class |
+|---|---|
+| 0 | car |
+| 1 | truck |
 
-If you drag and drop a directory with a dataset in a supported format, the Roboflow dashboard will automatically read the images and annotations together.
+```python
+rf = Roboflow(api_key="YOUR_API_KEY")
+project = rf.workspace("jawad").project("object-detect-korbo")
+dataset = project.version(1).download("yolov8")
+```
 
-<div align="center">
-  <img
-    width="640"
-    src="https://media.roboflow.com/preparing-custom-dataset-example/uploading-images.gif?ik-sdk-version=javascript-1.4.3&updatedAt=1672929808290"
-  >
-</div>
+### Step 3: Train YOLOv8
 
-### Step 3: Labeling
+We fine-tune the pretrained YOLOv8s model on our dataset for 50 epochs at an image size of 800. Training plots and weights are saved in `runs/detect/train/`.
 
-If you only have images, you can label them in [Roboflow Annotate](https://docs.roboflow.com/annotate).
+```python
+!yolo task=detect mode=train model=yolov8s.pt data={dataset.location}/data.yaml epochs=50 imgsz=800 plots=True
+```
 
-<div align="center">
-  <img
-    width="640"
-    src="https://user-images.githubusercontent.com/26109316/210901980-04861efd-dfc0-4a01-9373-13a36b5e1df4.gif"
-  >
-</div>
+We then check the confusion matrix (`confusion_matrix.png`), the training curves (`results.png`) and sample validation predictions (`val_batch0_pred.jpg`). Finally, we zip the trained weights so we can keep them.
 
-### Step 4: Generate new dataset version
+### Step 4: Load the traffic video and the trained model
 
-Now that we have our images and annotations added, we can Generate a Dataset Version. When Generating a Version, you may elect to add preprocessing and augmentations. This step is completely optional, however, it can allow you to significantly improve the robustness of your model.
+We download the test video (`vehicle-counting.mp4`) and load our best weights (`best.pt`) with YOLO. We keep only the two classes we trained on (`CLASS_ID = [0, 1]`). As a quick check, we run the model on the first frame and draw the detected boxes.
 
-<div align="center">
-  <img
-    width="640"
-    src="https://media.roboflow.com/preparing-custom-dataset-example/generate-new-version.gif?ik-sdk-version=javascript-1.4.3&updatedAt=1673003597834"
-  >
-</div>
+### Step 5: Set up tracking
 
-### Step 5: Exporting dataset
+Detection alone can't tell whether a car in one frame is the same car in the next, so we add **ByteTrack**. We clone the ByteTrack repository and set its parameters:
 
-Once the dataset version is generated, we have a hosted dataset we can load directly into our notebook for easy training.
+| Parameter | Value |
+|---|---|
+| `track_thresh` | 0.25 |
+| `track_buffer` | 30 |
+| `match_thresh` | 0.8 |
+| `aspect_ratio_thresh` | 3.0 |
+| `min_box_area` | 1.0 |
 
-<div align="center">
-  <img
-    width="640"
-    src="https://media.roboflow.com/preparing-custom-dataset-example/export.gif?ik-sdk-version=javascript-1.4.3&updatedAt=1672943313709"
-  >
-</div>
+Three helper functions connect YOLO and ByteTrack:
 
+- `detections2boxes`: converts YOLO detections into the format ByteTrack expects.
+- `tracks2boxes`: converts ByteTrack tracks back into boxes.
+- `match_detections_with_tracks`: matches each track to a detection by IoU, so every detection gets a tracker ID.
 
+### Step 6: Count vehicles
+
+We draw a horizontal counting line across the frame at y = 1500 (from x = 50 to x = 3790). The **supervision** `LineCounter` counts each tracked vehicle once as it crosses this line.
+
+For every frame of the video:
+
+1. YOLOv8 detects the vehicles in the frame.
+2. Detections that aren't car or truck are dropped.
+3. ByteTrack updates the tracks, and each detection gets its tracker ID.
+4. Detections without a tracker ID are dropped.
+5. The line counter updates with the tracked vehicles.
+6. Boxes, labels and the line with its counts are drawn on the frame.
+7. The frame is written to `vehicle-counting-result.mp4`.
+
+### Step 7: Validate the model
+
+We validate `best.pt` on the validation set with `yolo mode=val`. The precision, recall and mAP scores are in the Results section.
